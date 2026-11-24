@@ -1,0 +1,205 @@
+SDL 3.4.x: G923 for PlayStation/PC (046d:c266 native, c267 auto mode switch) in SDL3's lg4ff
+HIDAPI driver, and the driver enabled on Android. Apply with: git apply sdl3-lg4ff-g923-android.diff
+Base: release-3.4.20 (f00dc91). Not an SDL submission.
+
+diff --git a/src/haptic/hidapi/SDL_hidapihaptic_lg4ff.c b/src/haptic/hidapi/SDL_hidapihaptic_lg4ff.c
+index 7e6b3dc..4552055 100644
+--- a/src/haptic/hidapi/SDL_hidapihaptic_lg4ff.c
++++ b/src/haptic/hidapi/SDL_hidapihaptic_lg4ff.c
+@@ -43,6 +43,7 @@
+ #define USB_DEVICE_ID_LOGITECH_DFGT_WHEEL 0xc29a
+ #define USB_DEVICE_ID_LOGITECH_DFP_WHEEL 0xc298
+ #define USB_DEVICE_ID_LOGITECH_WHEEL 0xc294
++#define USB_DEVICE_ID_LOGITECH_G923_WHEEL 0xc266
+ 
+ static Uint32 supported_device_ids[] = {
+     USB_DEVICE_ID_LOGITECH_G29_WHEEL,
+@@ -50,7 +51,8 @@ static Uint32 supported_device_ids[] = {
+     USB_DEVICE_ID_LOGITECH_G25_WHEEL,
+     USB_DEVICE_ID_LOGITECH_DFGT_WHEEL,
+     USB_DEVICE_ID_LOGITECH_DFP_WHEEL,
+-    USB_DEVICE_ID_LOGITECH_WHEEL
++    USB_DEVICE_ID_LOGITECH_WHEEL,
++    USB_DEVICE_ID_LOGITECH_G923_WHEEL
+ };
+ 
+ 
+diff --git a/src/joystick/hidapi/SDL_hidapi_lg4ff.c b/src/joystick/hidapi/SDL_hidapi_lg4ff.c
+index fdf5b11..76b52e7 100644
+--- a/src/joystick/hidapi/SDL_hidapi_lg4ff.c
++++ b/src/joystick/hidapi/SDL_hidapi_lg4ff.c
+@@ -38,6 +38,8 @@
+ #define USB_DEVICE_ID_LOGITECH_DFGT_WHEEL 0xc29a
+ #define USB_DEVICE_ID_LOGITECH_DFP_WHEEL 0xc298
+ #define USB_DEVICE_ID_LOGITECH_WHEEL 0xc294
++#define USB_DEVICE_ID_LOGITECH_G923_WHEEL 0xc266
++#define USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL 0xc267
+ 
+ static Uint32 supported_device_ids[] = {
+     USB_DEVICE_ID_LOGITECH_G29_WHEEL,
+@@ -45,7 +47,9 @@ static Uint32 supported_device_ids[] = {
+     USB_DEVICE_ID_LOGITECH_G25_WHEEL,
+     USB_DEVICE_ID_LOGITECH_DFGT_WHEEL,
+     USB_DEVICE_ID_LOGITECH_DFP_WHEEL,
+-    USB_DEVICE_ID_LOGITECH_WHEEL
++    USB_DEVICE_ID_LOGITECH_WHEEL,
++    USB_DEVICE_ID_LOGITECH_G923_WHEEL,
++    USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL
+ };
+ 
+ // keep the same order as the supported_ids array
+@@ -55,7 +59,9 @@ static const char *supported_device_names[] = {
+     "Logitech G25",
+     "Logitech Driving Force GT",
+     "Logitech Driving Force Pro",
+-    "Driving Force EX"
++    "Driving Force EX",
++    "Logitech G923",
++    "Logitech G923 (PlayStation mode)"
+ };
+ 
+ static const char *HIDAPI_DriverLg4ff_GetDeviceName(Uint32 device_id)
+@@ -73,6 +79,7 @@ static int HIDAPI_DriverLg4ff_GetNumberOfButtons(Uint32 device_id)
+ {
+     switch (device_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+             return 25;
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+             return 23;
+@@ -117,6 +124,14 @@ static bool HIDAPI_DriverLg4ff_IsEnabled(void)
+      * this breaks ffb and led control, so we disable this by default
+      */
+     bool hint_default = false;
++    #elif defined(SDL_PLATFORM_ANDROID)
++    /*
++     * HIDAPI is off by default on Android because it asks for USB permission and takes the
++     * device over. Wheels are not usable through the Android input stack anyway (no FFB, the
++     * PlayStation mode G923 is not even a joystick there), so this driver stays on unless
++     * SDL_JOYSTICK_HIDAPI or SDL_JOYSTICK_HIDAPI_LG4FF explicitly turn it off.
++     */
++    bool hint_default = SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI, true);
+     #else
+     bool hint_default = SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI, SDL_HIDAPI_DEFAULT);
+     #endif
+@@ -246,6 +261,13 @@ static bool HIDAPI_DriverLg4ff_SwitchMode(SDL_HIDAPI_Device *device, Uint16 targ
+             ret = SDL_hid_write(device->dev, cmd, sizeof(cmd));
+             break;
+         }
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:{
++            // G923 for PlayStation boots as 046d:c267 and only accepts this command
++            // as output report 0x30; it then detaches and comes back as 046d:c266
++            Uint8 cmd[] = {0x30, 0xf8, 0x09, 0x07, 0x01, 0x01, 0x00, 0x00};
++            ret = SDL_hid_write(device->dev, cmd, sizeof(cmd));
++            break;
++        }
+         default:{
+             SDL_assert(0);
+         }
+@@ -280,6 +302,25 @@ static bool HIDAPI_DriverLg4ff_IsSupportedDevice(
+     if (i == SDL_arraysize(supported_device_ids)) {
+         return false;
+     }
++    if (product_id == USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL) {
++        // The PlayStation mode report format is not handled here. Claim the device so it gets
++        // opened, then ask it to re-enumerate in its native mode and let go of this instance.
++        if (interface_number > 0) {
++            // Only interface 0 has the output endpoint that takes the mode switch report
++            return false;
++        }
++        if (!device || !device->dev) {
++            return true;
++        }
++        if (SDL_HIDAPI_DriverLg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_NO_MODE_SWITCH", 0, 1, 0) == 0) {
++            HIDAPI_DriverLg4ff_SwitchMode(device, USB_DEVICE_ID_LOGITECH_G923_WHEEL);
++        }
++        return false;
++    }
++    if (product_id == USB_DEVICE_ID_LOGITECH_G923_WHEEL && interface_number > 0) {
++        // The G923 exposes extra HID interfaces next to the wheel itself on interface 0
++        return false;
++    }
+     Uint16 real_id = HIDAPI_DriverLg4ff_IdentifyWheel(product_id, version);
+     if (real_id == product_id || real_id == 0) {
+         // either it is already in native mode, or we don't know what the native mode is
+@@ -315,6 +356,7 @@ static bool HIDAPI_DriverLg4ff_SetRange(SDL_HIDAPI_Device *device, int range)
+     ctx->range = (Uint16)range;
+     switch (device->product_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G25_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_DFGT_WHEEL:{
+@@ -497,9 +539,8 @@ static bool HIDAPI_DriverLg4ff_InitDevice(SDL_HIDAPI_Device *device)
+ 
+     HIDAPI_SetDeviceName(device, HIDAPI_DriverLg4ff_GetDeviceName(device->product_id));
+ 
+-    if (SDL_hid_set_nonblocking(device->dev, 1) != 0) {
+-        return false;
+-    }
++    // Not fatal: Android's hidapi backend is always non-blocking and returns -1 here
++    SDL_hid_set_nonblocking(device->dev, 1);
+ 
+     if (!HIDAPI_DriverLg4ff_SetAutoCenter(device, 0)) {
+         return false;
+@@ -585,6 +626,7 @@ static bool HIDAPI_DriverLg4ff_HandleState(SDL_HIDAPI_Device *device,
+ 
+     switch (device->product_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G25_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_DFGT_WHEEL:
+@@ -641,6 +683,7 @@ static bool HIDAPI_DriverLg4ff_HandleState(SDL_HIDAPI_Device *device,
+ 
+     switch (device->product_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G25_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_DFGT_WHEEL:
+@@ -680,7 +723,8 @@ static bool HIDAPI_DriverLg4ff_HandleState(SDL_HIDAPI_Device *device,
+     }
+ 
+     switch (device->product_id) {
+-        case USB_DEVICE_ID_LOGITECH_G29_WHEEL:{
++        case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:{
+             Uint16 x = *(Uint16 *)&report_buf[4];
+             Uint16 last_x = *(Uint16 *)&ctx->last_report_buf[4];
+             if (x != last_x) {
+@@ -809,6 +853,7 @@ static bool HIDAPI_DriverLg4ff_UpdateDevice(SDL_HIDAPI_Device *device)
+ 
+     switch (device->product_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+             report_size = 12;
+             break;
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+@@ -854,6 +899,7 @@ static bool HIDAPI_DriverLg4ff_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joyst
+     joystick->nbuttons = HIDAPI_DriverLg4ff_GetNumberOfButtons(device->product_id);
+     switch(device->product_id){
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G25_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_WHEEL:
+@@ -886,6 +932,7 @@ static Uint32 HIDAPI_DriverLg4ff_GetJoystickCapabilities(SDL_HIDAPI_Device *devi
+ {
+     switch(device->product_id) {
+         case USB_DEVICE_ID_LOGITECH_G29_WHEEL:
++        case USB_DEVICE_ID_LOGITECH_G923_WHEEL:
+         case USB_DEVICE_ID_LOGITECH_G27_WHEEL:
+             return SDL_JOYSTICK_CAP_MONO_LED;
+         default:
+@@ -943,8 +990,9 @@ static bool HIDAPI_DriverLg4ff_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joy
+ {
+     int max_led = red;
+ 
+-    // only g27/g29, and g923 when supported is added
++    // only g27/g29/g923
+     if (device->product_id != USB_DEVICE_ID_LOGITECH_G29_WHEEL &&
++    device->product_id != USB_DEVICE_ID_LOGITECH_G923_WHEEL &&
+     device->product_id != USB_DEVICE_ID_LOGITECH_G27_WHEEL) {
+         return SDL_Unsupported();
+     }

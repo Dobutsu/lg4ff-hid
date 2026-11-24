@@ -1,0 +1,532 @@
+SDL 2.32.x: lg4ff HIDAPI driver for the Logitech G29 / G923 (PlayStation/PC), reduced port of
+SDL3's driver. The wheel appears as a game controller (steering = left X, throttle/brake =
+triggers, paddles = right stick up/down) with rumble as wheel vibration. Env overrides:
+SDL_HIDAPI_LG4FF_RANGE, _AUTOCENTER, _RUMBLE, _STEER_COMP, _NO_MODE_SWITCH.
+Apply with: git apply sdl2-lg4ff-hidapi-driver.diff
+Base: release-2.32.10 (5d24957). Not an SDL submission.
+
+diff --git a/include/SDL_hints.h b/include/SDL_hints.h
+index 6713d01fe..00b8a0d3f 100644
+--- a/include/SDL_hints.h
++++ b/include/SDL_hints.h
+@@ -1048,6 +1048,11 @@ extern "C" {
+  */
+ #define SDL_HINT_JOYSTICK_HIDAPI_STADIA "SDL_JOYSTICK_HIDAPI_STADIA"
+ 
++/**
++ * Whether the HIDAPI driver for Logitech G29/G923 wheels should be used (on by default).
++ */
++#define SDL_HINT_JOYSTICK_HIDAPI_LG4FF "SDL_JOYSTICK_HIDAPI_LG4FF"
++
+ /**
+  * A variable controlling whether the HIDAPI driver for Bluetooth Steam
+  * Controllers should be used.
+diff --git a/src/joystick/hidapi/SDL_hidapi_lg4ff.c b/src/joystick/hidapi/SDL_hidapi_lg4ff.c
+new file mode 100644
+index 000000000..516b72765
+--- /dev/null
++++ b/src/joystick/hidapi/SDL_hidapi_lg4ff.c
+@@ -0,0 +1,469 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 2025 Simon Wood <simon@mungewell.org>
++  Copyright (C) 2025 Michal Malý <madcatxster@devoid-pointer.net>
++  Copyright (C) 2025 Katharine Chui <katharine.chui@gmail.com>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++
++/*
++  ALTERED SOURCE VERSION (lg4ff-hid project; not an SDL submission).
++  Reduced SDL2 port of SDL3's SDL_hidapi_lg4ff.c for the Logitech G29 / G923
++  (PlayStation/PC), tested on Meta Quest 3.
++  The wheel is presented as a standard HIDAPI gamepad so that SDL2's automatic
++  HIDAPI mapping turns it into an SDL_GameController:
++    steering         -> left stick X (with optional dead zone pre-compensation)
++    throttle / brake -> right / left trigger
++    paddles R / L    -> right stick up / down
++  Rumble requests are rendered as a square wave of the wheel's constant force,
++  and the wheel's built-in autocenter spring is enabled.
++*/
++#include "../../SDL_internal.h"
++
++#ifdef SDL_JOYSTICK_HIDAPI
++
++#include "SDL_events.h"
++#include "SDL_joystick.h"
++#include "SDL_gamecontroller.h"
++#include "SDL_timer.h"
++#include "../SDL_sysjoystick.h"
++#include "SDL_hidapijoystick_c.h"
++
++#ifdef SDL_JOYSTICK_HIDAPI_LG4FF
++
++#define USB_VENDOR_ID_LOGITECH              0x046d
++#define USB_DEVICE_ID_LOGITECH_G29_WHEEL    0xc24f
++#define USB_DEVICE_ID_LOGITECH_G923_WHEEL   0xc266
++#define USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL 0xc267
++
++/* Defaults; each can be overridden by an env var */
++#define LG4FF_DEFAULT_RANGE      900 /* SDL_HIDAPI_LG4FF_RANGE, degrees 40..900 */
++#define LG4FF_DEFAULT_STEER_COMP 0   /* SDL_HIDAPI_LG4FF_STEER_COMP, % stick dead zone the game removes */
++#define LG4FF_DEFAULT_AUTOCENTER 30  /* SDL_HIDAPI_LG4FF_AUTOCENTER, % spring strength */
++#define LG4FF_DEFAULT_RUMBLE     40  /* SDL_HIDAPI_LG4FF_RUMBLE, % of full force for rumble */
++#define LG4FF_RUMBLE_HALF_PERIOD_MS 20
++
++/* G29 layout button bits, counted from bit 4 of the report */
++enum
++{
++    LG4FF_CROSS = 0,
++    LG4FF_SQUARE = 1,
++    LG4FF_CIRCLE = 2,
++    LG4FF_TRIANGLE = 3,
++    LG4FF_R1 = 4, /* right paddle */
++    LG4FF_L1 = 5, /* left paddle */
++    LG4FF_R2 = 6,
++    LG4FF_L2 = 7,
++    LG4FF_SHARE = 8,
++    LG4FF_OPTIONS = 9,
++    LG4FF_R3 = 10,
++    LG4FF_L3 = 11,
++    LG4FF_ENTER = 23,
++    LG4FF_PS = 24,
++    LG4FF_NUM_BUTTONS = 25
++};
++
++typedef struct
++{
++    Uint8 last_report[12];
++    SDL_bool have_report;
++    Uint32 last_buttons;
++    int steer_comp;    /* percent */
++    int rumble_max;    /* force units, 0..127 */
++    int rumble_level;  /* current request, 0..rumble_max */
++    int rumble_phase;
++    SDL_bool rumble_playing;
++    Uint32 rumble_toggle_ms;
++    int range;                 /* degrees currently set on the wheel */
++} SDL_DriverLg4ff_Context;
++
++static int Lg4ff_GetEnvInt(const char *name, int min, int max, int def)
++{
++    const char *s = SDL_getenv(name);
++    int v;
++    if (!s || !*s) {
++        return def;
++    }
++    v = SDL_atoi(s);
++    if (v < min) {
++        v = min;
++    }
++    if (v > max) {
++        v = max;
++    }
++    return v;
++}
++
++static void HIDAPI_DriverLg4ff_RegisterHints(SDL_HintCallback callback, void *userdata)
++{
++    SDL_AddHintCallback(SDL_HINT_JOYSTICK_HIDAPI_LG4FF, callback, userdata);
++}
++
++static void HIDAPI_DriverLg4ff_UnregisterHints(SDL_HintCallback callback, void *userdata)
++{
++    SDL_DelHintCallback(SDL_HINT_JOYSTICK_HIDAPI_LG4FF, callback, userdata);
++}
++
++static SDL_bool HIDAPI_DriverLg4ff_IsEnabled(void)
++{
++    /* HIDAPI is off by default on Android because it asks for USB permission and takes the
++       device over. Wheels have no usable path through the Android input stack (no FFB, the
++       PlayStation mode G923 isn't even a joystick there), so this driver stays on unless
++       SDL_JOYSTICK_HIDAPI or SDL_JOYSTICK_HIDAPI_LG4FF turn it off. */
++    return SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI_LG4FF,
++                              SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI, SDL_TRUE));
++}
++
++static int Lg4ff_Write(SDL_HIDAPI_Device *device, Uint8 b0, Uint8 b1, Uint8 b2, Uint8 b3, Uint8 b4)
++{
++    Uint8 cmd[7] = { 0 };
++    cmd[0] = b0;
++    cmd[1] = b1;
++    cmd[2] = b2;
++    cmd[3] = b3;
++    cmd[4] = b4;
++    return SDL_hid_write(device->dev, cmd, sizeof(cmd));
++}
++
++static SDL_bool HIDAPI_DriverLg4ff_IsSupportedDevice(SDL_HIDAPI_Device *device, const char *name, SDL_GameControllerType type, Uint16 vendor_id, Uint16 product_id, Uint16 version, int interface_number, int interface_class, int interface_subclass, int interface_protocol)
++{
++    if (vendor_id != USB_VENDOR_ID_LOGITECH) {
++        return SDL_FALSE;
++    }
++    if (product_id != USB_DEVICE_ID_LOGITECH_G29_WHEEL &&
++        product_id != USB_DEVICE_ID_LOGITECH_G923_WHEEL &&
++        product_id != USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL) {
++        return SDL_FALSE;
++    }
++    if (interface_number > 0) {
++        /* The G923 has extra HID interfaces; the wheel and its output endpoint are on interface 0 */
++        return SDL_FALSE;
++    }
++    if (product_id == USB_DEVICE_ID_LOGITECH_G923_PS_WHEEL) {
++        /* PlayStation mode: claim it so it gets opened, ask it to re-enumerate as 046d:c266,
++           then let go of this instance */
++        if (!device || !device->dev) {
++            return SDL_TRUE;
++        }
++        if (Lg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_NO_MODE_SWITCH", 0, 1, 0) == 0) {
++            Uint8 cmd[8] = { 0x30, 0xf8, 0x09, 0x07, 0x01, 0x01, 0x00, 0x00 };
++            SDL_hid_write(device->dev, cmd, sizeof(cmd));
++        }
++        return SDL_FALSE;
++    }
++    return SDL_TRUE;
++}
++
++static int Lg4ff_SetRange(SDL_HIDAPI_Device *device, int range)
++{
++    return Lg4ff_Write(device, 0xf8, 0x81, (Uint8)(range & 0xff), (Uint8)(range >> 8), 0);
++}
++
++/* magnitude 0..65535, same expansion as hid-lg4ff / SDL3 lg4ff */
++static int Lg4ff_SetAutoCenter(SDL_HIDAPI_Device *device, int magnitude)
++{
++    Uint32 expand_a, expand_b;
++
++    if (Lg4ff_Write(device, 0xf5, 0, 0, 0, 0) < 0) {
++        return -1;
++    }
++    if (magnitude <= 0) {
++        return 0;
++    }
++    if (magnitude > 65535) {
++        magnitude = 65535;
++    }
++    if (magnitude <= 0xaaaa) {
++        expand_a = 0x0c * magnitude;
++        expand_b = 0x80 * magnitude;
++    } else {
++        expand_a = (0x0c * 0xaaaa) + 0x06 * (magnitude - 0xaaaa);
++        expand_b = (0x80 * 0xaaaa) + 0xff * (magnitude - 0xaaaa);
++    }
++    expand_a = expand_a >> 1;
++    if (Lg4ff_Write(device, 0xfe, 0x0d, (Uint8)(expand_a / 0xaaaa), (Uint8)(expand_a / 0xaaaa), (Uint8)(expand_b / 0xaaaa)) < 0) {
++        return -1;
++    }
++    return Lg4ff_Write(device, 0x14, 0, 0, 0, 0);
++}
++
++static int Lg4ff_ConstantForce(SDL_HIDAPI_Device *device, int level)
++{
++    /* level -127..127, 0x80 is no force */
++    return Lg4ff_Write(device, 0x11, 0x08, (Uint8)(0x80 + level), 0x80, 0);
++}
++
++static int Lg4ff_StopForces(SDL_HIDAPI_Device *device)
++{
++    return Lg4ff_Write(device, 0x13, 0, 0, 0, 0);
++}
++
++static SDL_bool HIDAPI_DriverLg4ff_InitDevice(SDL_HIDAPI_Device *device)
++{
++    SDL_DriverLg4ff_Context *ctx = (SDL_DriverLg4ff_Context *)SDL_calloc(1, sizeof(*ctx));
++    if (!ctx) {
++        SDL_OutOfMemory();
++        return SDL_FALSE;
++    }
++    device->context = ctx;
++    ctx->steer_comp = Lg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_STEER_COMP", 0, 50, LG4FF_DEFAULT_STEER_COMP);
++    ctx->rumble_max = Lg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_RUMBLE", 0, 100, LG4FF_DEFAULT_RUMBLE) * 127 / 100;
++
++    /* Not fatal: Android's hidapi backend is always non-blocking and returns -1 here */
++    SDL_hid_set_nonblocking(device->dev, 1);
++
++    /* A failing write means this isn't the interface with the output endpoint */
++    if (Lg4ff_StopForces(device) < 0) {
++        return SDL_FALSE;
++    }
++    ctx->range = Lg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_RANGE", 40, 900, LG4FF_DEFAULT_RANGE);
++    Lg4ff_SetRange(device, ctx->range);
++    Lg4ff_SetAutoCenter(device, Lg4ff_GetEnvInt("SDL_HIDAPI_LG4FF_AUTOCENTER", 0, 100, LG4FF_DEFAULT_AUTOCENTER) * 65535 / 100);
++
++    HIDAPI_SetDeviceName(device, device->product_id == USB_DEVICE_ID_LOGITECH_G29_WHEEL ? "Logitech G29" : "Logitech G923");
++    SDL_Log("lg4ff: %04x:%04x ready (range %d, steer comp %d%%, rumble max %d)", device->vendor_id, device->product_id, ctx->range, ctx->steer_comp, ctx->rumble_max);
++    return HIDAPI_JoystickConnected(device, NULL);
++}
++
++static int HIDAPI_DriverLg4ff_GetDevicePlayerIndex(SDL_HIDAPI_Device *device, SDL_JoystickID instance_id)
++{
++    return -1;
++}
++
++static void HIDAPI_DriverLg4ff_SetDevicePlayerIndex(SDL_HIDAPI_Device *device, SDL_JoystickID instance_id, int player_index)
++{
++}
++
++static SDL_bool HIDAPI_DriverLg4ff_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick)
++{
++    SDL_DriverLg4ff_Context *ctx = (SDL_DriverLg4ff_Context *)device->context;
++
++    SDL_AssertJoysticksLocked();
++    ctx->have_report = SDL_FALSE;
++    ctx->last_buttons = 0;
++    joystick->nbuttons = 15; /* standard HIDAPI gamepad layout, see SDL_CreateMappingForHIDAPIController */
++    joystick->naxes = SDL_CONTROLLER_AXIS_MAX;
++    joystick->epowerlevel = SDL_JOYSTICK_POWER_WIRED;
++    return SDL_TRUE;
++}
++
++static int HIDAPI_DriverLg4ff_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
++{
++    SDL_DriverLg4ff_Context *ctx = (SDL_DriverLg4ff_Context *)device->context;
++    Uint16 amount = SDL_max(low_frequency_rumble, high_frequency_rumble);
++
++    /* Applied as a square wave from UpdateDevice */
++    ctx->rumble_level = (int)((Uint32)amount * (Uint32)ctx->rumble_max / 65535);
++    return 0;
++}
++
++static int HIDAPI_DriverLg4ff_RumbleJoystickTriggers(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint16 left_rumble, Uint16 right_rumble)
++{
++    return SDL_Unsupported();
++}
++
++static Uint32 HIDAPI_DriverLg4ff_GetJoystickCapabilities(SDL_HIDAPI_Device *device, SDL_Joystick *joystick)
++{
++    return SDL_JOYCAP_RUMBLE;
++}
++
++static int HIDAPI_DriverLg4ff_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint8 red, Uint8 green, Uint8 blue)
++{
++    return SDL_Unsupported();
++}
++
++static int HIDAPI_DriverLg4ff_SendJoystickEffect(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, const void *data, int size)
++{
++    /* Raw 7-byte classic Logitech command, for applications that want real force feedback */
++    if (size != 7) {
++        return SDL_SetError("lg4ff effects are 7 byte commands");
++    }
++    return SDL_hid_write(device->dev, (const unsigned char *)data, size) == size ? 0 : -1;
++}
++
++static int HIDAPI_DriverLg4ff_SetJoystickSensorsEnabled(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, SDL_bool enabled)
++{
++    return SDL_Unsupported();
++}
++
++static Sint16 Lg4ff_Steering(SDL_DriverLg4ff_Context *ctx, Uint16 raw)
++{
++    /* Optional: games that remove a stick dead zone (e.g. 24%) can get a wheel that stays
++       linear by encoding through the inverse; SDL_HIDAPI_LG4FF_STEER_COMP sets the percent. */
++    const float center = 0.01f;
++    int x = (int)raw - 32768;
++    float n = x / (x < 0 ? 32768.0f : 32767.0f);
++    float a = n < 0 ? -n : n;
++    float c = ctx->steer_comp / 100.0f;
++    float out;
++    long v;
++
++    if (ctx->steer_comp == 0) {
++        return (Sint16)SDL_clamp(x, SDL_MIN_SINT16, SDL_MAX_SINT16);
++    }
++    if (a < center) {
++        return 0;
++    }
++    out = c + (1.0f - c) * (a - center) / (1.0f - center);
++    v = (long)(out * 32767.0f + 0.5f);
++    if (v > 32767) {
++        v = 32767;
++    }
++    return (Sint16)(n < 0 ? -v : v);
++}
++
++static void HIDAPI_DriverLg4ff_HandleReport(SDL_Joystick *joystick, SDL_DriverLg4ff_Context *ctx, const Uint8 *data, int size)
++{
++    Uint32 buttons;
++    Uint8 hat;
++    int i;
++
++    if (size < 9) {
++        return;
++    }
++    /* 25 buttons from bit 4 of byte 0 */
++    buttons = ((Uint32)data[0] >> 4) | ((Uint32)data[1] << 4) | ((Uint32)data[2] << 12) | ((Uint32)data[3] << 20);
++    buttons &= (1u << LG4FF_NUM_BUTTONS) - 1;
++
++    if (!ctx->have_report || buttons != ctx->last_buttons) {
++        Uint32 changed = buttons ^ ctx->last_buttons;
++#define B(bit) ((buttons & (1u << (bit))) ? SDL_PRESSED : SDL_RELEASED)
++        for (i = 0; i < LG4FF_NUM_BUTTONS; ++i) {
++            if (changed & (1u << i)) {
++                SDL_Log("lg4ff: button %d %s", i, (buttons & (1u << i)) ? "down" : "up");
++            }
++        }
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_A, (buttons & ((1u << LG4FF_CROSS) | (1u << LG4FF_ENTER))) ? SDL_PRESSED : SDL_RELEASED);
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_B, B(LG4FF_CIRCLE));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_X, B(LG4FF_SQUARE));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_Y, B(LG4FF_TRIANGLE));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_BACK, B(LG4FF_SHARE));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_GUIDE, B(LG4FF_PS));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_START, B(LG4FF_OPTIONS));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_LEFTSTICK, B(LG4FF_L3));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_RIGHTSTICK, B(LG4FF_R3));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, B(LG4FF_L2));
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, B(LG4FF_R2));
++#undef B
++        /* Paddles shift gears: right stick up / down */
++        SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_RIGHTY,
++                                (buttons & (1u << LG4FF_R1)) ? SDL_MIN_SINT16 : (buttons & (1u << LG4FF_L1)) ? SDL_MAX_SINT16 : 0);
++        ctx->last_buttons = buttons;
++    }
++
++    hat = data[0] & 0x0f;
++    if (!ctx->have_report || hat != (ctx->last_report[0] & 0x0f)) {
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_DPAD_UP, (hat == 7 || hat == 0 || hat == 1) ? SDL_PRESSED : SDL_RELEASED);
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, (hat >= 1 && hat <= 3) ? SDL_PRESSED : SDL_RELEASED);
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_DPAD_DOWN, (hat >= 3 && hat <= 5) ? SDL_PRESSED : SDL_RELEASED);
++        SDL_PrivateJoystickButton(joystick, SDL_CONTROLLER_BUTTON_DPAD_LEFT, (hat >= 5 && hat <= 7) ? SDL_PRESSED : SDL_RELEASED);
++    }
++
++    SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_LEFTX, Lg4ff_Steering(ctx, (Uint16)(data[4] | (data[5] << 8))));
++    SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_LEFTY, 0);
++    SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_RIGHTX, 0);
++    /* Pedals report 255 when released; triggers are full range with -32768 released */
++    SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, (Sint16)((255 - data[6]) * 257 - 32768));
++    SDL_PrivateJoystickAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERLEFT, (Sint16)((255 - data[7]) * 257 - 32768));
++
++    SDL_memcpy(ctx->last_report, data, SDL_min((size_t)size, sizeof(ctx->last_report)));
++    ctx->have_report = SDL_TRUE;
++}
++
++static void HIDAPI_DriverLg4ff_UpdateRumble(SDL_HIDAPI_Device *device, SDL_DriverLg4ff_Context *ctx)
++{
++    Uint32 now = SDL_GetTicks();
++
++    if (ctx->rumble_level > 0) {
++        if (!ctx->rumble_playing || (Uint32)(now - ctx->rumble_toggle_ms) >= LG4FF_RUMBLE_HALF_PERIOD_MS) {
++            ctx->rumble_phase = !ctx->rumble_phase;
++            ctx->rumble_toggle_ms = now;
++            ctx->rumble_playing = SDL_TRUE;
++            Lg4ff_ConstantForce(device, ctx->rumble_phase ? ctx->rumble_level : -ctx->rumble_level);
++        }
++    } else if (ctx->rumble_playing) {
++        ctx->rumble_playing = SDL_FALSE;
++        Lg4ff_StopForces(device);
++    }
++}
++
++static SDL_bool HIDAPI_DriverLg4ff_UpdateDevice(SDL_HIDAPI_Device *device)
++{
++    SDL_DriverLg4ff_Context *ctx = (SDL_DriverLg4ff_Context *)device->context;
++    SDL_Joystick *joystick = NULL;
++    Uint8 data[USB_PACKET_LENGTH];
++    int size;
++
++    if (device->num_joysticks > 0) {
++        joystick = SDL_JoystickFromInstanceID(device->joysticks[0]);
++    } else {
++        return SDL_FALSE;
++    }
++
++    while ((size = SDL_hid_read_timeout(device->dev, data, sizeof(data), 0)) > 0) {
++        if (joystick) {
++            HIDAPI_DriverLg4ff_HandleReport(joystick, ctx, data, size);
++        }
++    }
++    if (size < 0) {
++        /* Read error, device is disconnected */
++        HIDAPI_JoystickDisconnected(device, device->joysticks[0]);
++        return SDL_FALSE;
++    }
++    HIDAPI_DriverLg4ff_UpdateRumble(device, ctx);
++    return SDL_TRUE;
++}
++
++static void HIDAPI_DriverLg4ff_CloseJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick)
++{
++    SDL_DriverLg4ff_Context *ctx = (SDL_DriverLg4ff_Context *)device->context;
++
++    ctx->rumble_level = 0;
++    ctx->rumble_playing = SDL_FALSE;
++    Lg4ff_StopForces(device);
++}
++
++static void HIDAPI_DriverLg4ff_FreeDevice(SDL_HIDAPI_Device *device)
++{
++}
++
++SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverLg4ff = {
++    SDL_HINT_JOYSTICK_HIDAPI_LG4FF,
++    SDL_TRUE,
++    HIDAPI_DriverLg4ff_RegisterHints,
++    HIDAPI_DriverLg4ff_UnregisterHints,
++    HIDAPI_DriverLg4ff_IsEnabled,
++    HIDAPI_DriverLg4ff_IsSupportedDevice,
++    HIDAPI_DriverLg4ff_InitDevice,
++    HIDAPI_DriverLg4ff_GetDevicePlayerIndex,
++    HIDAPI_DriverLg4ff_SetDevicePlayerIndex,
++    HIDAPI_DriverLg4ff_UpdateDevice,
++    HIDAPI_DriverLg4ff_OpenJoystick,
++    HIDAPI_DriverLg4ff_RumbleJoystick,
++    HIDAPI_DriverLg4ff_RumbleJoystickTriggers,
++    HIDAPI_DriverLg4ff_GetJoystickCapabilities,
++    HIDAPI_DriverLg4ff_SetJoystickLED,
++    HIDAPI_DriverLg4ff_SendJoystickEffect,
++    HIDAPI_DriverLg4ff_SetJoystickSensorsEnabled,
++    HIDAPI_DriverLg4ff_CloseJoystick,
++    HIDAPI_DriverLg4ff_FreeDevice,
++};
++
++#endif /* SDL_JOYSTICK_HIDAPI_LG4FF */
++
++#endif /* SDL_JOYSTICK_HIDAPI */
+diff --git a/src/joystick/hidapi/SDL_hidapijoystick.c b/src/joystick/hidapi/SDL_hidapijoystick.c
+index 7bc52305e..f1577a0a3 100644
+--- a/src/joystick/hidapi/SDL_hidapijoystick.c
++++ b/src/joystick/hidapi/SDL_hidapijoystick.c
+@@ -46,6 +46,9 @@ struct joystick_hwdata
+ };
+ 
+ static SDL_HIDAPI_DeviceDriver *SDL_HIDAPI_drivers[] = {
++#ifdef SDL_JOYSTICK_HIDAPI_LG4FF
++    &SDL_HIDAPI_DriverLg4ff,
++#endif
+ #ifdef SDL_JOYSTICK_HIDAPI_GAMECUBE
+     &SDL_HIDAPI_DriverGameCube,
+ #endif
+diff --git a/src/joystick/hidapi/SDL_hidapijoystick_c.h b/src/joystick/hidapi/SDL_hidapijoystick_c.h
+index a46151594..86e2ec461 100644
+--- a/src/joystick/hidapi/SDL_hidapijoystick_c.h
++++ b/src/joystick/hidapi/SDL_hidapijoystick_c.h
+@@ -38,6 +38,7 @@
+ #define SDL_JOYSTICK_HIDAPI_PS4
+ #define SDL_JOYSTICK_HIDAPI_PS5
+ #define SDL_JOYSTICK_HIDAPI_STADIA
++#define SDL_JOYSTICK_HIDAPI_LG4FF
+ #define SDL_JOYSTICK_HIDAPI_STEAM /* Simple support for BLE Steam Controller, hint is disabled by default */
+ #define SDL_JOYSTICK_HIDAPI_STEAMDECK
+ #define SDL_JOYSTICK_HIDAPI_SWITCH
+@@ -142,6 +143,7 @@ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverPS4;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverPS5;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverShield;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverStadia;
++extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverLg4ff;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverSteam;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverSteamDeck;
+ extern SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverSwitch;

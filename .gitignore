@@ -1,0 +1,4 @@
+examples/wheeldemo/android/build/
+*.apk
+*.idsig
+debug.keystore
