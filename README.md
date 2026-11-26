@@ -10,7 +10,7 @@ What you get:
 - Steering is a `-1..1` float over the configured rotation. Throttle, brake and clutch are `0..1`. You also get the 25 buttons and the D-pad.
 - Force feedback: rotation range (40–900°), the wheel's centering spring, a constant force, and rumble emulation for games that only know gamepad rumble.
 
-Tested on a G923 for PlayStation/PC on Meta Quest 3 (Horizon OS, Android 14). The G29 shares the protocol and report layout, but nobody has tested it with this library yet. The Xbox G923 (`046d:c26e`, `c26d`) uses a different protocol and isn't supported.
+Tested on a G923 for PlayStation/PC on Meta Quest 3 (Horizon OS, Android 14).  The Xbox G923 (`046d:c26e`, `c26d`) uses a different protocol and isn't supported.
 
 ## Use
 
